@@ -449,11 +449,11 @@ extension CLLocationCoordinate2D {
 enum Geocoder {
     static func name(for coordinate: CLLocationCoordinate2D) async -> String? {
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
-        guard let placemark = try? await CLGeocoder().reverseGeocodeLocation(location).first else { return nil }
+        guard let request = MKReverseGeocodingRequest(location: location),
+              let item = try? await request.mapItems.first else { return nil }
         var parts: [String] = []
-        for p in [placemark.name, placemark.locality ?? placemark.administrativeArea ?? placemark.country]
-        where p != nil && !parts.contains(p!) {
-            parts.append(p!)
+        for p in [item.name, item.addressRepresentations?.cityName] {
+            if let p, !p.isEmpty, !parts.contains(p) { parts.append(p) }
         }
         return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }

@@ -435,7 +435,7 @@ final class PlaceSearch: NSObject, MKLocalSearchCompleterDelegate {
     func resolve(_ completion: MKLocalSearchCompletion) async -> (coordinate: CLLocationCoordinate2D, name: String)? {
         let response = try? await MKLocalSearch(request: MKLocalSearch.Request(completion: completion)).start()
         guard let item = response?.mapItems.first else { return nil }
-        return (item.placemark.coordinate, item.name ?? completion.title)
+        return (item.location.coordinate, item.name ?? completion.title)
     }
 
     /// Plain search for when the user presses Return before suggestions arrive.
@@ -447,7 +447,7 @@ final class PlaceSearch: NSObject, MKLocalSearchCompleterDelegate {
         if let region { request.region = region }
         let response = try? await MKLocalSearch(request: request).start()
         guard let item = response?.mapItems.first else { return nil }
-        return (item.placemark.coordinate, item.name ?? q)
+        return (item.location.coordinate, item.name ?? q)
     }
 
     nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
