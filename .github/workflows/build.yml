@@ -1,0 +1,34 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  app:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: ./scripts/build-app.sh
+      - run: ditto -c -k --keepParent "build/Location+.app" build/Location+.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Location+
+          path: build/Location+.zip
+
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r engine/requirements.txt
+      - name: Engine starts and shuts down cleanly
+        run: |
+          out=$( (echo '{"cmd":"set","udid":"x","lat":1,"lng":2}'; sleep 3) | timeout 30 python engine/engine.py)
+          echo "$out"
+          echo "$out" | grep -q '"type": "ready"'
+          echo "$out" | grep -q '"state": "stopped"'
