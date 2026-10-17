@@ -138,7 +138,59 @@ async def main() -> None:
     except ValueError:
         pass
 
+    await watcher_tests()
     print("engine tests passed")
+
+
+async def watcher_tests() -> None:
+    import json as _json
+    out: list[dict] = []
+
+    class W(engine.DeviceWatcher):
+        pass
+
+    async def tunnels():
+        return {"SLOW": [{"interface": "mobdev2-SLOW-1", "tunnel-address": "x", "tunnel-port": 1}],
+                "FAST": [{"interface": "usbmux-FAST-USB", "tunnel-address": "y", "tunnel-port": 2}]}
+
+    async def no_mux():
+        return []
+
+    class Info:
+        product_type = "iPhone18,1"
+        product_version = "27.0"
+
+        def __init__(self, name):
+            self.all_values = {"DeviceName": name}
+
+        async def close(self):
+            pass
+
+    async def connect(udid):
+        if udid == "SLOW":
+            await asyncio.sleep(30)  # hangs; must not block the scan
+        return Info("Habib's iPhone")
+
+    engine.get_tunneld_tunnels = tunnels
+    engine.usbmux.list_devices = no_mux
+    engine.connect_rsd = connect
+    real_write = sys.stdout.write
+    sys.stdout.write = lambda text: out.append(_json.loads(text)) or len(text)
+    try:
+        w = W()
+        start = asyncio.get_running_loop().time()
+        await w.scan()
+        assert asyncio.get_running_loop().time() - start < 1, "scan blocked on identify"
+        await asyncio.sleep(0.05)
+        await w.scan()
+    finally:
+        sys.stdout.write = real_write
+    devices = {d["udid"]: d for d in out[-1]["devices"]}
+    assert devices["FAST"]["name"] == "Habib's iPhone" and devices["FAST"]["ready"], devices
+    assert devices["FAST"]["connection"] == "USB" and devices["FAST"]["os_version"] == "27.0"
+    assert devices["SLOW"]["connection"] == "Wi-Fi" and devices["SLOW"]["ready"]
+    for t in w.identifying.values():
+        t.cancel()
 
 
 asyncio.run(main())

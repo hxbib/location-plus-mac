@@ -49,7 +49,8 @@ KEEPALIVE_SECONDS = 10  # re-assert the coordinate; also how we notice a dead ch
 MAX_BACKOFF_SECONDS = 15
 CONNECT_TIMEOUT = 15
 SET_TIMEOUT = 10
-MOUNT_TIMEOUT = 300  # first mount downloads the developer disk image
+MOUNT_TIMEOUT = 300
+IDENTIFY_INTERVAL = 10  # first mount downloads the developer disk image
 
 DEV_MODE_OFF = "Developer Mode is off. Turn it on in Settings › Privacy & Security › Developer Mode."
 UNREACHABLE = "iPhone isn't reachable. Keep it unlocked and connected."
@@ -127,6 +128,30 @@ class DeviceWatcher:
         self.usb_issue: dict[str, Optional[str]] = {}
         self.last_payload: Optional[str] = None
         self.wakeup = asyncio.Event()
+        self.identifying: dict[str, asyncio.Task] = {}
+        self.last_attempt: dict[str, float] = {}
+
+    def _identify_soon(self, udid: str, tunneled: bool) -> None:
+        """Identify in the background so a slow or untrusted device never stalls the scan.
+
+        Rate-limited per device: re-asking every scan would also re-trigger the
+        iPhone's "Trust This Computer?" prompt.
+        """
+        now = asyncio.get_running_loop().time()
+        if udid in self.identifying or now - self.last_attempt.get(udid, -math.inf) < IDENTIFY_INTERVAL:
+            return
+        self.last_attempt[udid] = now
+
+        async def work() -> None:
+            try:
+                await (self._identify_tunnel(udid) if tunneled else self._identify_usb(udid))
+            except Exception as e:
+                log.info("identify %s: %r", udid, e)
+            finally:
+                self.identifying.pop(udid, None)
+                self.wakeup.set()
+
+        self.identifying[udid] = asyncio.create_task(work())
 
     async def _identify_usb(self, udid: str) -> None:
         info = self.identity.get(udid) or DeviceInfo(udid=udid)
@@ -179,15 +204,12 @@ class DeviceWatcher:
         for udid in sorted(set(tunnels) | set(mux)):
             tunneled = bool(tunnels.get(udid))
             m = mux.get(udid)
-            try:
-                if udid not in self.identity and tunneled:
-                    await self._identify_tunnel(udid)
-                elif m is not None and not tunneled and (udid not in self.identity or self.usb_issue.get(udid)):
-                    # Re-check untunneled devices so a fixed issue (trusted,
-                    # Developer Mode enabled) clears by itself.
-                    await self._identify_usb(udid)
-            except Exception as e:
-                log.info("identify %s: %r", udid, e)
+            if udid not in self.identity and tunneled:
+                self._identify_soon(udid, tunneled=True)
+            elif m is not None and not tunneled and (udid not in self.identity or self.usb_issue.get(udid)):
+                # Re-check untunneled devices so a fixed issue (trusted,
+                # Developer Mode enabled) clears by itself.
+                self._identify_soon(udid, tunneled=False)
 
             d = DeviceInfo(**asdict(self.identity.get(udid) or DeviceInfo(udid=udid)))
             if tunneled:
