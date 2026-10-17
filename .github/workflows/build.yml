@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   engine:
     runs-on: ubuntu-latest
@@ -74,5 +78,9 @@ jobs:
           BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "build/Location+.app/Contents/Info.plist")
           TAG="v$VERSION-$BUILD"
           cp "build/Location+.dmg" "build/Location+-$VERSION.dmg"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "build/Location+-$VERSION.dmg" --clobber
+            exit 0
+          fi
           gh release create "$TAG" "build/Location+-$VERSION.dmg" --title "Location+ $VERSION (build $BUILD)" \
             --notes "Download the DMG, open it, and drag Location+ to Applications. See README for first-launch steps." --latest
