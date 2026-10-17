@@ -2,22 +2,14 @@ name: Build
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
-jobs:
-  app:
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - run: swift --version
-      - run: ./scripts/build-app.sh
-      - run: ditto -c -k --keepParent "build/Location+.app" build/Location+.zip
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Location+
-          path: build/Location+.zip
+permissions:
+  contents: write
 
+jobs:
   engine:
     runs-on: ubuntu-latest
     steps:
@@ -25,10 +17,62 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install -r engine/requirements.txt
+      - run: pip install -r engine/requirements.txt pyflakes
+      - run: python -m pyflakes engine/
+      - run: python engine/test_engine.py
       - name: Engine starts and shuts down cleanly
         run: |
           out=$( (echo '{"cmd":"set","udid":"x","lat":1,"lng":2}'; sleep 3) | timeout 30 python engine/engine.py)
           echo "$out"
           echo "$out" | grep -q '"type": "ready"'
           echo "$out" | grep -q '"state": "stopped"'
+
+  engine-macos:
+    # Same pinned Python the app downloads; proves every wheel installs on macOS.
+    runs-on: macos-26
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            sha: 16a5332fb0dcb77f163fc8f8cbccd95be1644cc53e68e5d2a79f50afd6680a0e
+            run: ""
+          - arch: x86_64
+            sha: f507ae04eb7747cd97cb484e8c5d83936cbfc52d9b08a1f35c00b47c707b1ae1
+            run: "arch -x86_64"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rosetta
+        if: matrix.arch == 'x86_64'
+        run: softwareupdate --install-rosetta --agree-to-license || true
+      - name: Engine environment
+        run: |
+          curl -sSLo py.tgz "https://github.com/astral-sh/python-build-standalone/releases/download/20261013/cpython-3.13.16%2B20261013-${{ matrix.arch }}-apple-darwin-install_only_stripped.tar.gz"
+          echo "${{ matrix.sha }}  py.tgz" | shasum -a 256 -c
+          tar -xzf py.tgz
+          ${{ matrix.run }} python/bin/python3 -m venv venv
+          ${{ matrix.run }} venv/bin/python3 -m pip install --only-binary=:all: -r engine/requirements.txt
+          ${{ matrix.run }} venv/bin/python3 engine/test_engine.py
+
+  app:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: swift --version
+      - run: ./scripts/build-app.sh --dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Location+
+          path: build/Location+.dmg
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "build/Location+.app/Contents/Info.plist")
+          BUILD=$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "build/Location+.app/Contents/Info.plist")
+          TAG="v$VERSION-$BUILD"
+          cp "build/Location+.dmg" "build/Location+-$VERSION.dmg"
+          gh release create "$TAG" "build/Location+-$VERSION.dmg" --title "Location+ $VERSION (build $BUILD)" \
+            --notes "Download the DMG, open it, and drag Location+ to Applications. See README for first-launch steps." --latest

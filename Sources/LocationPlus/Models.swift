@@ -34,11 +34,13 @@ struct Pin: Equatable {
     var coordinate: CLLocationCoordinate2D
     var state: PinState
     var error: String?
+    var detail: String?
+    var since = Date()
 
     static func == (a: Pin, b: Pin) -> Bool {
         a.coordinate.latitude == b.coordinate.latitude
             && a.coordinate.longitude == b.coordinate.longitude
-            && a.state == b.state && a.error == b.error
+            && a.state == b.state && a.error == b.error && a.detail == b.detail
     }
 }
 
@@ -81,6 +83,7 @@ extension CLLocationCoordinate2D {
 
 /// Saved places and recents, persisted as JSON in UserDefaults.
 struct PlaceStore {
+    static let recentLimit = 15
     private static let savedKey = "savedPlaces"
     private static let recentKey = "recentPlaces"
 
@@ -105,4 +108,19 @@ struct PlaceStore {
         get { load(recentKey) }
         set { save(newValue, recentKey) }
     }
+}
+
+/// A coordinate that can be persisted (for resuming pins after relaunch).
+struct SavedPin: Codable {
+    let udid: String
+    let name: String
+    let latitude: Double
+    let longitude: Double
+
+    var coordinate: CLLocationCoordinate2D { .init(latitude: latitude, longitude: longitude) }
+}
+
+extension Place {
+    /// Placeholder names are the raw coordinates; these get reverse-geocoded later.
+    var hasPlaceholderName: Bool { name == coordinate.formatted }
 }

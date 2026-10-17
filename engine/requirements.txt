@@ -1,1 +1,1 @@
-pymobiledevice3>=11.34
+pymobiledevice3==11.34.0

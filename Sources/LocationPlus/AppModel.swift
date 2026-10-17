@@ -1,3 +1,4 @@
+import AppKit
 import CoreLocation
 import Foundation
 import MapKit
@@ -6,6 +7,7 @@ import SwiftUI
 
 struct ActivePin: Identifiable {
     let udid: String
+    let name: String
     let device: Device?
     let pin: Pin
     var id: String { udid }
@@ -21,10 +23,13 @@ final class AppModel {
     // Devices & pins
     var devices: [Device] = []
     var tunnelRunning: Bool?
-    var pins: [String: Pin] = [:]
+    var pins: [String: Pin] = [:] { didSet { persistPins() } }
     var selection: Set<String> = []
     var engineRunning = false
+    var engineVersion: String?
+    var engineFailed = false
     var lastError: String?
+    var notice: String?
 
     // Map target
     var target: CLLocationCoordinate2D?
@@ -35,17 +40,47 @@ final class AppModel {
     var saved: [Place] = PlaceStore.saved { didSet { PlaceStore.saved = saved } }
     var recent: [Place] = PlaceStore.recent { didSet { PlaceStore.recent = recent } }
 
+    /// Pins that were active when the app last quit, offered for resuming.
+    var resumable: [SavedPin] = []
+
+    /// Device names survive unplugging so pins keep a readable label.
+    private var knownNames: [String: String] = UserDefaults.standard.dictionary(forKey: "knownDeviceNames") as? [String: String] ?? [:] {
+        didSet { UserDefaults.standard.set(knownNames, forKey: "knownDeviceNames") }
+    }
+
     private var process: Process?
     private var engineInput: FileHandle?
     private var buffer = Data()
     private var geocodeTask: Task<Void, Never>?
     private var deliberateStop = false
+    private var recentCrashes: [Date] = []
+    private var didAutoSelect = false
+
+    private static let resumeKey = "pinsAtQuit"
 
     private init() {
-        if let last = recent.first {
-            camera = .region(MKCoordinateRegion(center: last.coordinate, latitudinalMeters: 4000, longitudinalMeters: 4000))
+        if let result = Migration.runIfNeeded(saved: saved, recent: recent) {
+            saved = result.saved
+            recent = result.recent
+            if result.importedSaved + result.importedRecent > 0 {
+                notice = "Imported \(result.importedSaved) saved places and \(result.importedRecent) recent locations from the previous version."
+            }
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.resumeKey),
+           let pins = try? JSONDecoder().decode([SavedPin].self, from: data) {
+            resumable = pins
+        }
+        if let last = resumable.first?.coordinate ?? recent.first?.coordinate {
+            camera = .region(MKCoordinateRegion(center: last, latitudinalMeters: 4000, longitudinalMeters: 4000))
         }
         if setup.engine.isDone { startEngine() }
+        nameUnnamedPlaces()
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { AppModel.shared.send(["cmd": "kick"]) }
+        }
     }
 
     // MARK: Derived state
@@ -54,11 +89,12 @@ final class AppModel {
         pins.filter { $0.value.state != .stopped }
             .sorted { $0.key < $1.key }
             .map { entry in
-                ActivePin(udid: entry.key, device: devices.first { $0.udid == entry.key }, pin: entry.value)
+                ActivePin(udid: entry.key, name: name(for: entry.key),
+                          device: devices.first { $0.udid == entry.key }, pin: entry.value)
             }
     }
 
-    var isPinning: Bool { !activePins.isEmpty }
+    var isPinning: Bool { pins.values.contains { $0.state != .stopped } }
 
     var selectedDevices: [Device] { devices.filter { selection.contains($0.udid) } }
 
@@ -67,29 +103,37 @@ final class AppModel {
         guard let target, !selection.isEmpty else { return false }
         return selection.allSatisfy { udid in
             guard let pin = pins[udid], pin.state != .stopped else { return false }
-            return Place(name: "", coordinate: pin.coordinate).isNear(target)
+            return pin.coordinate.isNear(target)
         }
     }
 
     func name(for udid: String) -> String {
-        devices.first(where: { $0.udid == udid })?.name ?? "iPhone"
+        devices.first(where: { $0.udid == udid })?.name ?? knownNames[udid] ?? "iPhone"
+    }
+
+    func placeName(for coordinate: CLLocationCoordinate2D) -> String {
+        if let t = target, t.isNear(coordinate), let n = targetName { return n }
+        return (saved + recent).first(where: { $0.isNear(coordinate) })?.name ?? coordinate.formatted
     }
 
     // MARK: Actions
 
     func setTarget(_ coordinate: CLLocationCoordinate2D, name: String? = nil, moveCamera: Bool = false) {
         target = coordinate
-        targetName = name ?? saved.first(where: { $0.isNear(coordinate) })?.name
+        let known = (saved + recent).first(where: { $0.isNear(coordinate) && !$0.hasPlaceholderName })?.name
+        targetName = name ?? known
         if moveCamera {
-            camera = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 1500, longitudinalMeters: 1500))
+            withAnimation(.smooth(duration: 0.6)) {
+                camera = .region(MKCoordinateRegion(center: coordinate, latitudinalMeters: 1500, longitudinalMeters: 1500))
+            }
         }
         geocodeTask?.cancel()
         guard targetName == nil else { return }
         geocodeTask = Task {
-            try? await Task.sleep(for: .milliseconds(250))
+            try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
             let name = await Geocoder.name(for: coordinate)
-            if !Task.isCancelled, self.target.map({ Place(name: "", coordinate: $0).isNear(coordinate) }) == true {
+            if !Task.isCancelled, self.target?.isNear(coordinate) == true {
                 self.targetName = name
             }
         }
@@ -99,12 +143,13 @@ final class AppModel {
         guard let target, !selection.isEmpty else { return }
         for udid in selection {
             var pin = pins[udid] ?? Pin(coordinate: target, state: .connecting)
-            if pin.state == .stopped { pin.state = .connecting }
+            if pin.state == .stopped { pin = Pin(coordinate: target, state: .connecting) }
             pin.coordinate = target
             pin.error = nil
             pins[udid] = pin
             send(["cmd": "set", "udid": udid, "lat": target.latitude, "lng": target.longitude])
         }
+        resumable = []
         addRecent(Place(name: targetName ?? target.formatted, coordinate: target))
     }
 
@@ -114,7 +159,7 @@ final class AppModel {
     }
 
     func stopSelection() {
-        selection.forEach(stop)
+        for udid in selection { stop(udid) }
     }
 
     func stopAll() {
@@ -122,14 +167,33 @@ final class AppModel {
         send(["cmd": "clear_all"])
     }
 
-    func saveTarget(as name: String? = nil) {
+    func resume() {
+        for saved in resumable {
+            pins[saved.udid] = Pin(coordinate: saved.coordinate, state: .connecting)
+            send(["cmd": "set", "udid": saved.udid, "lat": saved.latitude, "lng": saved.longitude])
+        }
+        if let first = resumable.first { setTarget(first.coordinate, moveCamera: true) }
+        resumable = []
+    }
+
+    func dismissResume() {
+        resumable = []
+        UserDefaults.standard.removeObject(forKey: Self.resumeKey)
+    }
+
+    func showOnMap(_ udid: String) {
+        guard let pin = pins[udid], pin.state != .stopped else { return }
+        setTarget(pin.coordinate, moveCamera: true)
+    }
+
+    func saveTarget() {
         guard let target else { return }
         if let i = saved.firstIndex(where: { $0.isNear(target) }) {
             saved.remove(at: i)
             return
         }
-        saved.insert(Place(name: name ?? targetName ?? target.formatted, coordinate: target), at: 0)
-        targetName = saved[0].name
+        saved.insert(Place(name: targetName ?? target.formatted, coordinate: target), at: 0)
+        if targetName == nil { targetName = saved[0].name }
     }
 
     var targetIsSaved: Bool {
@@ -137,19 +201,49 @@ final class AppModel {
         return saved.contains { $0.isNear(target) }
     }
 
+    func importFromPreviousVersion() {
+        let result = Migration.importLegacy(into: saved, recent: recent)
+        saved = result.saved
+        recent = result.recent
+        notice = result.importedSaved + result.importedRecent == 0
+            ? "Nothing new to import."
+            : "Imported \(result.importedSaved) saved places and \(result.importedRecent) recent locations."
+        nameUnnamedPlaces()
+    }
+
     private func addRecent(_ place: Place) {
         recent.removeAll { $0.isNear(place.coordinate) }
         recent.insert(place, at: 0)
-        if recent.count > 12 { recent.removeLast(recent.count - 12) }
+        if recent.count > PlaceStore.recentLimit { recent.removeLast(recent.count - PlaceStore.recentLimit) }
+        nameUnnamedPlaces()
+    }
+
+    /// Replaces coordinate-only names with a reverse-geocoded one, gently (Apple rate-limits geocoding).
+    private func nameUnnamedPlaces() {
+        let pending = (saved + recent).filter(\.hasPlaceholderName).map(\.coordinate)
+        guard !pending.isEmpty else { return }
+        Task {
+            for c in pending {
+                guard let name = await Geocoder.name(for: c) else { continue }
+                if let i = saved.firstIndex(where: { $0.isNear(c) && $0.hasPlaceholderName }) { saved[i].name = name }
+                if let i = recent.firstIndex(where: { $0.isNear(c) && $0.hasPlaceholderName }) { recent[i].name = name }
+                try? await Task.sleep(for: .milliseconds(700))
+            }
+        }
     }
 
     // MARK: Engine process
 
     func startEngine() {
-        guard process == nil else { return }
+        guard process == nil, setup.engine.isDone else { return }
         let p = Process()
         p.executableURL = setup.venvPython
         p.arguments = ["-u", Setup.engineScript.path]
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "PYTHONPATH")
+        env.removeValue(forKey: "PYTHONHOME")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        p.environment = env
         let inPipe = Pipe(), outPipe = Pipe()
         p.standardInput = inPipe
         p.standardOutput = outPipe
@@ -157,6 +251,7 @@ final class AppModel {
 
         outPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil }
             DispatchQueue.main.async { MainActor.assumeIsolated { AppModel.shared.consume(data) } }
         }
         p.terminationHandler = { _ in
@@ -167,13 +262,21 @@ final class AppModel {
             process = p
             engineInput = inPipe.fileHandleForWriting
             engineRunning = true
+            engineFailed = false
             deliberateStop = false
         } catch {
             lastError = "Couldn't start the engine: \(error.localizedDescription)"
+            engineFailed = true
         }
     }
 
     func restartEngine() {
+        recentCrashes = []
+        engineFailed = false
+        if process == nil {
+            startEngine()
+            return
+        }
         deliberateStop = true
         process?.terminate()
     }
@@ -184,9 +287,22 @@ final class AppModel {
         buffer.removeAll()
         engineRunning = false
         devices = []
+        tunnelRunning = nil
         let wasDeliberate = deliberateStop
+        deliberateStop = false
+
+        if !wasDeliberate {
+            recentCrashes = recentCrashes.filter { $0.timeIntervalSinceNow > -60 } + [Date()]
+            if recentCrashes.count >= 4 {
+                // Something is structurally wrong (broken venv, missing file). Don't spin.
+                engineFailed = true
+                setup.refresh()
+                for udid in pins.keys { pins[udid]?.state = .stopped }
+                return
+            }
+        }
         Task {
-            try? await Task.sleep(for: .seconds(wasDeliberate ? 0.2 : 1.5))
+            try? await Task.sleep(for: .seconds(wasDeliberate ? 0.2 : Double(recentCrashes.count)))
             startEngine()
             // Re-assert anything that was pinned when the engine went away.
             for (udid, pin) in pins where pin.state != .stopped {
@@ -196,18 +312,34 @@ final class AppModel {
         }
     }
 
-    /// Called right before the app quits: closing stdin makes the engine clear every pin.
+    /// Called right before the app quits: remembers pins for next launch, then
+    /// closes stdin, which makes the engine clear every pin and exit.
     func shutdown() {
         deliberateStop = true
         process?.terminationHandler = nil
         try? engineInput?.close()
-        process?.waitUntilExitOrTimeout(4)
+        process?.waitUntilExitOrTimeout(5)
+    }
+
+    /// Saved continuously (not just at quit) so pins can be resumed after a crash or power loss too.
+    private func persistPins() {
+        let active = pins.filter { $0.value.state != .stopped }.sorted { $0.key < $1.key }.map {
+            SavedPin(udid: $0.key, name: name(for: $0.key),
+                     latitude: $0.value.coordinate.latitude, longitude: $0.value.coordinate.longitude)
+        }
+        guard let data = try? JSONEncoder().encode(active),
+              data != UserDefaults.standard.data(forKey: Self.resumeKey) else { return }
+        UserDefaults.standard.set(data, forKey: Self.resumeKey)
     }
 
     private func send(_ message: [String: Any]) {
         guard let engineInput, var data = try? JSONSerialization.data(withJSONObject: message) else { return }
         data.append(0x0A)
-        try? engineInput.write(contentsOf: data)
+        do {
+            try engineInput.write(contentsOf: data)
+        } catch {
+            // Broken pipe: the engine died; engineExited() restarts it and re-pins.
+        }
     }
 
     private func consume(_ data: Data) {
@@ -218,24 +350,37 @@ final class AppModel {
             buffer.removeSubrange(buffer.startIndex...nl)
             if let msg = try? JSONDecoder().decode(EngineMessage.self, from: line) { handle(msg) }
         }
+        if buffer.count > 4_000_000 { buffer.removeAll() }  // never let a bad stream grow unbounded
     }
 
     private func handle(_ msg: EngineMessage) {
         switch msg.type {
+        case "ready":
+            engineVersion = msg.version
+            recentCrashes = []
         case "devices":
             tunnelRunning = msg.tunnel
-            devices = msg.devices ?? []
-            let ids = Set(devices.map(\.udid))
-            selection.formIntersection(ids.union(pins.keys))
-            if selection.isEmpty, devices.count == 1 { selection = [devices[0].udid] }
+            let list = msg.devices ?? []
+            if list != devices { devices = list }
+            for d in list where knownNames[d.udid] != d.name { knownNames[d.udid] = d.name }
+            let ids = Set(list.map(\.udid))
+            selection.formIntersection(ids.union(pins.filter { $0.value.state != .stopped }.keys))
+            // Auto-select when a device first shows up, but respect a deliberate deselect.
+            if list.isEmpty { didAutoSelect = false }
+            if selection.isEmpty, !didAutoSelect, let first = list.first(where: \.ready) ?? list.first {
+                selection = [first.udid]
+                didAutoSelect = true
+            }
         case "session":
             guard let udid = msg.udid, let state = msg.state.flatMap(PinState.init(rawValue:)) else { return }
             // Ignore late updates for a pin the user already stopped.
             if pins[udid]?.state == .stopped, state != .stopped { return }
-            var pin = pins[udid] ?? Pin(coordinate: target ?? .init(), state: state)
+            guard var pin = pins[udid] ?? msg.coordinate.map({ Pin(coordinate: $0, state: state) }) else { return }
+            if state == .pinned && pin.state != .pinned { pin.since = Date() }
             pin.state = state
-            if state == .pinned || msg.error != nil || state == .connecting { pin.error = msg.error }
-            if let lat = msg.lat, let lng = msg.lng { pin.coordinate = .init(latitude: lat, longitude: lng) }
+            pin.error = state == .stopped ? nil : msg.error
+            pin.detail = msg.detail
+            if let c = msg.coordinate { pin.coordinate = c }
             pins[udid] = pin
         case "error":
             lastError = msg.message
@@ -245,10 +390,15 @@ final class AppModel {
     }
 
     private static func logHandle() -> FileHandle? {
-        let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Logs/Location+", isDirectory: true)
+        let dir = logDirectory
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("engine.log")
+        // Rotate past 5 MB so the log can't grow without bound.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? Int, size > 5_000_000 {
+            let old = dir.appendingPathComponent("engine.old.log")
+            try? FileManager.default.removeItem(at: old)
+            try? FileManager.default.moveItem(at: file, to: old)
+        }
         if !FileManager.default.fileExists(atPath: file.path) {
             FileManager.default.createFile(atPath: file.path, contents: nil)
         }
@@ -272,7 +422,14 @@ private struct EngineMessage: Decodable {
     var lat: Double?
     var lng: Double?
     var error: String?
+    var detail: String?
     var message: String?
+    var version: String?
+
+    var coordinate: CLLocationCoordinate2D? {
+        guard let lat, let lng else { return nil }
+        return .init(latitude: lat, longitude: lng)
+    }
 }
 
 private extension Process {
@@ -283,13 +440,21 @@ private extension Process {
     }
 }
 
+extension CLLocationCoordinate2D {
+    func isNear(_ other: CLLocationCoordinate2D) -> Bool {
+        abs(latitude - other.latitude) < 0.00005 && abs(longitude - other.longitude) < 0.00005
+    }
+}
+
 enum Geocoder {
     static func name(for coordinate: CLLocationCoordinate2D) async -> String? {
         let location = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
         guard let placemark = try? await CLGeocoder().reverseGeocodeLocation(location).first else { return nil }
-        let parts = [placemark.name, placemark.locality].compactMap { $0 }
-        var unique: [String] = []
-        for p in parts where !unique.contains(p) { unique.append(p) }
-        return unique.isEmpty ? nil : unique.joined(separator: ", ")
+        var parts: [String] = []
+        for p in [placemark.name, placemark.locality ?? placemark.administrativeArea ?? placemark.country]
+        where p != nil && !parts.contains(p!) {
+            parts.append(p!)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
     }
 }

@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 struct SetupView: View {
@@ -12,50 +13,53 @@ struct SetupView: View {
             VStack(spacing: 10) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()
-                    .frame(width: 88, height: 88)
+                    .frame(width: 96, height: 96)
+                    .shadow(color: .black.opacity(0.15), radius: 8, y: 4)
                 Text("Welcome to Location+")
                     .font(.largeTitle.weight(.semibold))
-                Text("Pin your iPhone's location from your Mac. Two quick steps and you're set.")
+                Text("Pin your iPhone's location from your Mac.\nOne-time setup takes about a minute.")
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
 
             VStack(spacing: 0) {
                 StepRow(number: 1, title: "Install the engine",
-                        detail: "Sets up pymobiledevice3 in a private Python environment.",
-                        status: mergedEngineStatus)
+                        detail: "Downloads a private copy of Python and pymobiledevice3. Needs internet.",
+                        status: setup.engine)
                 Divider().padding(.leading, 52)
                 StepRow(number: 2, title: "Install the tunnel service",
-                        detail: "Lets your Mac talk to your iPhone. You'll enter your password once.",
+                        detail: "Lets your Mac talk to iOS 17 and later. You'll enter your Mac password once.",
                         status: setup.tunnel)
                 Divider().padding(.leading, 52)
                 StepRow(number: 3, title: "Prepare your iPhone",
-                        detail: "Turn on Developer Mode in Settings › Privacy & Security, connect it with a cable, and tap Trust.",
+                        detail: "Turn on Developer Mode in Settings › Privacy & Security, connect it with a cable, unlock it and tap Trust.",
                         status: nil)
             }
             .padding(.vertical, 6)
             .background(.background.secondary, in: .rect(cornerRadius: 16))
-            .frame(maxWidth: 520)
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(.separator, lineWidth: 0.5))
+            .frame(maxWidth: 540)
 
             Button {
                 Task { await runSetup() }
             } label: {
-                Text(running ? "Setting Up…" : "Set Up")
-                    .frame(minWidth: 160)
+                Text(buttonTitle)
+                    .frame(minWidth: 170)
             }
             .buttonStyle(.glassProminent)
             .controlSize(.extraLarge)
+            .keyboardShortcut(.defaultAction)
             .disabled(running)
         }
         .padding(48)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// Python lookup failures surface on the engine step.
-    private var mergedEngineStatus: Setup.Status {
-        if case .failed = setup.python { return setup.python }
-        if case .working = setup.python { return setup.python }
-        return setup.engine
+    private var buttonTitle: String {
+        if running { return "Setting Up…" }
+        if case .failed = setup.engine { return "Try Again" }
+        if case .failed = setup.tunnel { return "Try Again" }
+        return setup.engine.isDone ? "Continue" : "Set Up"
     }
 
     private func runSetup() async {
@@ -85,6 +89,7 @@ private struct StepRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(.headline)
                 Text(detail).font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 switch status ?? .pending {
                 case .working(let message):
                     Text(message).font(.callout).foregroundStyle(Color.accentColor)
@@ -93,6 +98,7 @@ private struct StepRow: View {
                         .font(.callout)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 default:
                     EmptyView()
                 }
@@ -101,22 +107,29 @@ private struct StepRow: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
+        .animation(.snappy, value: status)
     }
 
     @ViewBuilder private var indicator: some View {
         switch status ?? .pending {
         case .done:
             Image(systemName: "checkmark.circle.fill").font(.title2).foregroundStyle(.green)
+                .transition(.scale.combined(with: .opacity))
         case .working:
             ProgressView().controlSize(.small)
         case .failed:
             Image(systemName: "exclamationmark.circle.fill").font(.title2).foregroundStyle(.red)
         default:
-            Text("\(number)")
+            Text(status == nil ? "" : "\(number)")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: 24, height: 24)
                 .background(.quaternary, in: .circle)
+                .overlay {
+                    if status == nil {
+                        Image(systemName: "iphone").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
         }
     }
 }
@@ -140,21 +153,21 @@ struct MenuBarContent: View {
             }
 
             if model.activePins.isEmpty {
-                Text("Not pinning any devices")
+                Text(model.devices.isEmpty ? "No iPhone connected" : "Not pinning any devices")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 6)
             } else {
-                VStack(spacing: 6) {
+                VStack(spacing: 8) {
                     ForEach(model.activePins) { item in
                         HStack(spacing: 10) {
                             Image(systemName: item.device?.symbol ?? "iphone")
                                 .frame(width: 18)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(item.device?.name ?? "iPhone").lineLimit(1)
-                                Text(placeName(item.pin))
+                                Text(item.name).lineLimit(1)
+                                Text(item.pin.error ?? model.placeName(for: item.pin.coordinate))
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(item.pin.error == nil ? AnyShapeStyle(.secondary) : AnyShapeStyle(.orange))
                                     .lineLimit(1)
                             }
                             Spacer()
@@ -166,9 +179,17 @@ struct MenuBarContent: View {
                             }
                             .buttonStyle(.plain)
                             .help("Stop")
+                            .accessibilityLabel("Stop \(item.name)")
                         }
                     }
                 }
+            }
+
+            if model.tunnelRunning == false || model.engineFailed {
+                Label(model.engineFailed ? "Engine stopped. Open Location+ to fix." : "Tunnel service isn't running.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
 
             Divider()
@@ -188,15 +209,104 @@ struct MenuBarContent: View {
                     Image(systemName: "power")
                 }
                 .help("Quit Location+")
+                .accessibilityLabel("Quit Location+")
             }
             .buttonStyle(.glass)
             .controlSize(.small)
         }
         .padding(14)
-        .frame(width: 300)
+        .frame(width: 310)
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @Environment(AppModel.self) private var model
+    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var busy = false
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Open at login", isOn: $launchAtLogin)
+                    .onChange(of: launchAtLogin) { _, enabled in
+                        do {
+                            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+                        } catch {
+                            model.lastError = "Couldn't change login item: \(error.localizedDescription)"
+                            launchAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    }
+                Text("Location+ lives in the menu bar, so closing the window keeps your pins active.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Tunnel Service") {
+                LabeledContent("Status") {
+                    Text(tunnelStatus).foregroundStyle(model.tunnelRunning == true ? Color.green : Color.secondary)
+                }
+                HStack {
+                    Button("Restart") { run { await model.setup.restartTunnel() } }
+                    Button("Reinstall") { run { await model.setup.installTunnel() } }
+                    Spacer()
+                    Button("Uninstall", role: .destructive) { run { await model.setup.uninstallTunnel() } }
+                }
+                .disabled(busy)
+            }
+
+            Section("Engine") {
+                LabeledContent("pymobiledevice3") { Text(model.engineVersion ?? "—").monospacedDigit() }
+                HStack {
+                    Button("Restart Engine") { model.restartEngine() }
+                    Button("Reinstall Engine") {
+                        run {
+                            await model.setup.installEngine()
+                            model.restartEngine()
+                        }
+                    }
+                    Spacer()
+                    Button("Show Logs") { NSWorkspace.shared.open(AppModel.logDirectory) }
+                }
+                .disabled(busy)
+                if case .working(let message) = model.setup.engine {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                } else if case .failed(let message) = model.setup.engine {
+                    Text(message).font(.caption).foregroundStyle(.red)
+                }
+            }
+
+            Section("Places") {
+                HStack {
+                    Button("Import from Previous Version") { model.importFromPreviousVersion() }
+                        .disabled(!Migration.hasLegacyData)
+                    Button("Add Original Presets") {
+                        for preset in Migration.presets where !model.saved.contains(where: { $0.isNear(preset.coordinate) }) {
+                            model.saved.append(preset)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .frame(width: 480)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func placeName(_ pin: Pin) -> String {
-        (model.saved + model.recent).first(where: { $0.isNear(pin.coordinate) })?.name ?? pin.coordinate.formatted
+    private var tunnelStatus: String {
+        switch model.tunnelRunning {
+        case true?: return "Running"
+        case false?: return model.setup.tunnel.isDone ? "Not running" : "Not installed"
+        case nil: return "Checking…"
+        }
+    }
+
+    private func run(_ work: @escaping () async -> Void) {
+        busy = true
+        Task {
+            await work()
+            busy = false
+        }
     }
 }
